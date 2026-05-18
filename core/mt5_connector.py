@@ -175,6 +175,18 @@ class MT5Connector:
             return None
         return {"bid": tick.bid, "ask": tick.ask, "time": tick.time}
 
+    def _get_filling_mode(self, symbol: str):
+        """Detect the filling mode supported by the broker for this symbol."""
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return mt5.ORDER_FILLING_IOC
+        filling = info.filling_mode
+        if filling & 1:   # ORDER_FILLING_FOK
+            return mt5.ORDER_FILLING_FOK
+        if filling & 2:   # ORDER_FILLING_IOC
+            return mt5.ORDER_FILLING_IOC
+        return mt5.ORDER_FILLING_RETURN  # fallback for ECN/STP brokers
+
     def place_order(
         self,
         symbol: str,
@@ -192,6 +204,7 @@ class MT5Connector:
         order_type = mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL
         tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if direction == "LONG" else tick.bid
+        filling = self._get_filling_mode(symbol)
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -205,15 +218,22 @@ class MT5Connector:
             "magic": magic,
             "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": filling,
         }
 
         result = mt5.order_send(request)
+
+        # Retry with RETURN filling if first attempt failed (common on ECN brokers)
+        if (result is None or result.retcode != mt5.TRADE_RETCODE_DONE) and filling != mt5.ORDER_FILLING_RETURN:
+            logger.warning(f"Order filling {filling} failed (retcode={getattr(result,'retcode',None)}), retrying with FILLING_RETURN")
+            request["type_filling"] = mt5.ORDER_FILLING_RETURN
+            result = mt5.order_send(request)
+
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error(f"Order failed: {result}")
+            logger.error(f"Order failed: retcode={getattr(result,'retcode',None)} | comment={getattr(result,'comment',None)} | {mt5.last_error()}")
             return None
 
-        logger.info(f"Order placed: ticket={result.order} {direction} {lot:.2f} @ {price:.2f} SL={sl:.2f} TP={tp:.2f}")
+        logger.info(f"Order placed: ticket={result.order} {direction} {lot:.2f} @ {price:.2f} SL={sl:.2f} TP={tp:.2f} filling={filling}")
         return result.order
 
     def close_partial(self, ticket: int, volume: float, symbol: str, direction: str, magic: int = 20260518) -> bool:
@@ -225,6 +245,7 @@ class MT5Connector:
         tick = mt5.symbol_info_tick(symbol)
         price = tick.bid if direction == "LONG" else tick.ask
 
+        filling = self._get_filling_mode(symbol)
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -236,12 +257,16 @@ class MT5Connector:
             "magic": magic,
             "comment": "PARTIAL_CLOSE",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": filling,
         }
 
         result = mt5.order_send(request)
+        if (result is None or result.retcode != mt5.TRADE_RETCODE_DONE) and filling != mt5.ORDER_FILLING_RETURN:
+            request["type_filling"] = mt5.ORDER_FILLING_RETURN
+            result = mt5.order_send(request)
+
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error(f"Partial close failed ticket={ticket}: {result}")
+            logger.error(f"Partial close failed ticket={ticket}: retcode={getattr(result,'retcode',None)} | {mt5.last_error()}")
             return False
 
         logger.info(f"Partial close: ticket={ticket} volume={volume:.2f}")

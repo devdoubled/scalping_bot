@@ -286,6 +286,27 @@ class ScalpingBot:
             self.trade_manager.handle_sl_hit(ticket, exit_price)
             self._log(f"SL hit detected: ticket={ticket}", "WARN")
 
+    def _start_price_ticker(self):
+        def _ticker():
+            while self.connector.is_connected():
+                try:
+                    tick = self.connector.get_current_price(self.symbol)
+                    spread = self.connector.get_current_spread(self.symbol) or 0
+                    if tick and self._dashboard:
+                        mid = (tick["bid"] + tick["ask"]) / 2
+                        self._dashboard.update_price(tick["bid"], tick["ask"], spread)
+                        if self.trade_manager:
+                            pnls = {t.ticket: t.unrealized_pnl(mid)
+                                    for t in self.trade_manager.get_trades()}
+                            if pnls:
+                                self._dashboard.update_position_pnl(pnls)
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        t = threading.Thread(target=_ticker, daemon=True)
+        t.start()
+
     def _update_dashboard_state(self):
         if self._dashboard:
             self._dashboard.update_state(self._state)
@@ -338,6 +359,7 @@ def main():
                     "TRADE" if not cfg.get("paper_mode") else "WARN",
                 )
                 dashboard.update_account(acc["balance"], acc["equity"], 0.0, 0)
+                bot._start_price_ticker()
         else:
             dashboard.update_connection(False)
             dashboard.log("MT5 connection failed. Check mt5_credentials.json and ensure MT5 terminal is running.", "ERROR")

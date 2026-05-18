@@ -495,6 +495,16 @@ class Dashboard:
             self._box_sig["inn"].config(bg=C["input"])
             self._signal_val.config(text="— WAIT", fg=C["muted"])
 
+    def update_price(self, bid: float, ask: float, spread: float):
+        price = (bid + ask) / 2
+        spread_color = C["red"] if spread > 25 else C["green"]
+
+        def _apply():
+            self._price_val.config(text=f"{price:,.2f}", fg=C["text"])
+            self._spread_val.config(text=f"{spread:.0f} pts", fg=spread_color)
+
+        self.root.after(0, _apply)
+
     def update_filters(self, filters: dict):
         for key, w in self._fw.items():
             ok = bool(filters.get(key, False))
@@ -524,6 +534,23 @@ class Dashboard:
                 f"{t.tp3:.2f}",
                 "--",
             ))
+
+    def update_position_pnl(self, pnls: dict):
+        """Update only the P&L column for open positions (ticket → pnl map)."""
+        def _apply():
+            for item in self._tree.get_children():
+                vals = self._tree.item(item, "values")
+                if not vals:
+                    continue
+                try:
+                    ticket = int(vals[0])
+                except (ValueError, IndexError):
+                    continue
+                if ticket in pnls:
+                    new_vals = list(vals)
+                    new_vals[8] = f"${pnls[ticket]:+,.2f}"
+                    self._tree.item(item, values=new_vals)
+        self.root.after(0, _apply)
 
     def update_performance(self, stats: dict):
         """Update the today's performance strip with stats from RiskManager."""

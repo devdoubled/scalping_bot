@@ -187,6 +187,15 @@ class MT5Connector:
             return mt5.ORDER_FILLING_IOC
         return mt5.ORDER_FILLING_RETURN  # fallback for ECN/STP brokers
 
+    def is_algo_trading_enabled(self) -> bool:
+        """Return False if the MT5 terminal has Algo Trading toggled off."""
+        if not MT5_AVAILABLE or not self._connected:
+            return True  # paper mode — no restriction
+        info = mt5.terminal_info()
+        if info is None:
+            return True
+        return bool(info.trade_allowed)
+
     def place_order(
         self,
         symbol: str,
@@ -200,6 +209,10 @@ class MT5Connector:
         if self._paper_mode or not self._connected:
             logger.info(f"[PAPER] {direction} {lot:.2f}L {symbol} | SL={sl:.2f} TP={tp:.2f}")
             return -1
+
+        if not self.is_algo_trading_enabled():
+            logger.error("Order blocked: Algo Trading is disabled in the MT5 terminal. Enable it via the toolbar button.")
+            return None
 
         order_type = mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL
         tick = mt5.symbol_info_tick(symbol)

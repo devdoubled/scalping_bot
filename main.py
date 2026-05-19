@@ -244,6 +244,12 @@ class ScalpingBot:
         lot = self.risk_manager.calculate_lot_size(balance, sl_distance, tick_value, volume_step)
         lot = max(lot, self._symbol_info.get("volume_min", 0.01))
 
+        if not self.connector.is_algo_trading_enabled():
+            self._log("Order blocked: enable Algo Trading in the MT5 terminal toolbar (the 'Algo Trading' button).", "ERROR")
+            self._state = STATE_STOPPED
+            self._update_dashboard_state()
+            return
+
         self._log(f"Entering {direction} | Lot={lot:.2f} | SL={sl:.2f} | TP3={tp3:.2f}", "TRADE")
 
         ticket = self.connector.place_order(

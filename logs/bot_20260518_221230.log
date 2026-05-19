@@ -1,6 +1,0 @@
-2026-05-18 22:12:31,001 [INFO] core.mt5_connector: Attempting to connect to running MT5 terminal...
-2026-05-18 22:12:31,007 [INFO] core.mt5_connector: Auto-connected to MT5 | Account: 5047989235 | Balance: 64588.53 USD
-2026-05-18 22:12:50,779 [INFO] main: Bot starting...
-2026-05-18 22:12:50,780 [INFO] main: Bot started | Symbol: XAUUSD | Mode: PAPER
-2026-05-18 22:15:04,801 [INFO] core.mt5_connector: MT5 disconnected
-2026-05-18 22:15:04,801 [INFO] main: Bot stopped.

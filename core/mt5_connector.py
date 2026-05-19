@@ -32,6 +32,16 @@ class MT5Connector:
         self._paper_mode = paper_mode
         self._connected = False
         self._credentials: Dict[str, Any] = {}
+        self._next_paper_ticket = -1
+
+    @property
+    def paper_mode(self) -> bool:
+        return self._paper_mode
+
+    def _new_paper_ticket(self) -> int:
+        ticket = self._next_paper_ticket
+        self._next_paper_ticket -= 1
+        return ticket
 
     def connect(self) -> bool:
         if not MT5_AVAILABLE:
@@ -106,6 +116,18 @@ class MT5Connector:
     def is_connected(self) -> bool:
         return self._connected
 
+    def ensure_symbol(self, symbol: str) -> bool:
+        if not self._connected:
+            return False
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            logger.error(f"Symbol not found: {symbol}")
+            return False
+        if not info.visible and not mt5.symbol_select(symbol, True):
+            logger.error(f"Could not select symbol: {symbol} | {mt5.last_error()}")
+            return False
+        return True
+
     def get_account_info(self) -> Optional[Dict]:
         if not self._connected:
             return None
@@ -123,6 +145,8 @@ class MT5Connector:
 
     def get_ohlcv(self, symbol: str, timeframe: str, count: int = 100) -> Optional[pd.DataFrame]:
         if not self._connected:
+            return None
+        if not self.ensure_symbol(symbol):
             return None
 
         tf = TIMEFRAME_MAP.get(timeframe)
@@ -146,6 +170,8 @@ class MT5Connector:
     def get_current_spread(self, symbol: str) -> Optional[float]:
         if not self._connected:
             return None
+        if not self.ensure_symbol(symbol):
+            return None
         info = mt5.symbol_info(symbol)
         if info is None:
             return None
@@ -153,6 +179,8 @@ class MT5Connector:
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict]:
         if not self._connected:
+            return None
+        if not self.ensure_symbol(symbol):
             return None
         info = mt5.symbol_info(symbol)
         if info is None:
@@ -164,16 +192,30 @@ class MT5Connector:
             "volume_step": info.volume_step,
             "volume_max": info.volume_max,
             "trade_tick_value": info.trade_tick_value,
+            "trade_tick_size": getattr(info, "trade_tick_size", info.point),
             "trade_contract_size": info.trade_contract_size,
         }
 
     def get_current_price(self, symbol: str) -> Optional[Dict]:
         if not self._connected:
             return None
+        if not self.ensure_symbol(symbol):
+            return None
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return None
         return {"bid": tick.bid, "ask": tick.ask, "time": tick.time}
+
+    def _resolve_position_ticket(self, symbol: str, magic: int, fallback_ticket: int) -> int:
+        for _ in range(5):
+            positions = mt5.positions_get(symbol=symbol)
+            if positions:
+                matches = [p for p in positions if p.magic == magic]
+                if matches:
+                    latest = max(matches, key=lambda p: getattr(p, "time_msc", getattr(p, "time", 0)))
+                    return latest.ticket
+            time.sleep(0.1)
+        return fallback_ticket
 
     def _get_filling_mode(self, symbol: str):
         """Detect the filling mode supported by the broker for this symbol."""
@@ -198,11 +240,17 @@ class MT5Connector:
         comment: str = "XAUUSD_SCALPER",
     ) -> Optional[int]:
         if self._paper_mode or not self._connected:
-            logger.info(f"[PAPER] {direction} {lot:.2f}L {symbol} | SL={sl:.2f} TP={tp:.2f}")
-            return -1
+            ticket = self._new_paper_ticket()
+            logger.info(f"[PAPER] {direction} {lot:.2f}L {symbol} ticket={ticket} | SL={sl:.2f} TP={tp:.2f}")
+            return ticket
 
         order_type = mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL
+        if not self.ensure_symbol(symbol):
+            return None
         tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            logger.error(f"Order failed: no tick for {symbol}")
+            return None
         price = tick.ask if direction == "LONG" else tick.bid
         filling = self._get_filling_mode(symbol)
 
@@ -233,8 +281,9 @@ class MT5Connector:
             logger.error(f"Order failed: retcode={getattr(result,'retcode',None)} | comment={getattr(result,'comment',None)} | {mt5.last_error()}")
             return None
 
-        logger.info(f"Order placed: ticket={result.order} {direction} {lot:.2f} @ {price:.2f} SL={sl:.2f} TP={tp:.2f} filling={filling}")
-        return result.order
+        ticket = self._resolve_position_ticket(symbol, magic, result.order)
+        logger.info(f"Order placed: ticket={ticket} {direction} {lot:.2f} @ {price:.2f} SL={sl:.2f} TP={tp:.2f} filling={filling}")
+        return ticket
 
     def close_partial(self, ticket: int, volume: float, symbol: str, direction: str, magic: int = 20260518) -> bool:
         if self._paper_mode or not self._connected:
@@ -242,7 +291,12 @@ class MT5Connector:
             return True
 
         order_type = mt5.ORDER_TYPE_SELL if direction == "LONG" else mt5.ORDER_TYPE_BUY
+        if not self.ensure_symbol(symbol):
+            return False
         tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            logger.error(f"Partial close failed ticket={ticket}: no tick for {symbol}")
+            return False
         price = tick.bid if direction == "LONG" else tick.ask
 
         filling = self._get_filling_mode(symbol)

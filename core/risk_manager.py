@@ -1,7 +1,7 @@
 import math
 import logging
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -32,30 +32,47 @@ class RiskManager:
         if self._session_start_balance is None:
             self._session_start_balance = balance
 
-    def calculate_lot_size(self, balance: float, sl_distance: float, tick_value: float, volume_step: float = 0.01) -> float:
+    def calculate_lot_size(
+        self,
+        balance: float,
+        sl_distance: float,
+        tick_value: float,
+        volume_step: float = 0.01,
+        tick_size: float = 0.01,
+        volume_min: float = 0.01,
+        volume_max: Optional[float] = None,
+    ) -> float:
         """
         Calculate lot size such that the dollar loss at SL equals risk_percent of balance.
-        sl_distance: in price units (e.g. 1.50 means $1.50 for XAUUSD where 1 pip = $1)
-        tick_value: value of 1 pip per 0.01 lot (from broker)
+        Uses the broker's tick size/value for the symbol instead of a hard-coded XAUUSD pip value.
         """
-        if sl_distance <= 0 or tick_value <= 0:
-            return volume_step
+        if sl_distance <= 0 or tick_value <= 0 or tick_size <= 0 or volume_step <= 0:
+            return max(volume_min, volume_step)
 
         risk_amount = balance * self.risk_percent
-        # sl_distance in price / pip_size gives pips; tick_value per 0.01 lot
-        # lot = risk_amount / (sl_pips * tick_value_per_lot)
-        # For XAUUSD: 1 pip = $1 per 0.01 lot, so tick_value_per_lot = tick_value * 100
-        sl_pips = sl_distance / 0.01  # XAUUSD pip = 0.01
-        pip_value_per_lot = tick_value * 100  # scale from 0.01 lot to 1 lot
+        loss_per_lot = (sl_distance / tick_size) * tick_value
+        if loss_per_lot <= 0:
+            return max(volume_min, volume_step)
 
-        raw_lot = risk_amount / (sl_pips * pip_value_per_lot)
+        raw_lot = risk_amount / loss_per_lot
         lot = math.floor(raw_lot / volume_step) * volume_step
-        lot = max(volume_step, round(lot, 2))
+        lot = max(volume_min, lot)
+        if volume_max:
+            lot = min(volume_max, lot)
 
-        logger.debug(f"Lot calc: balance={balance:.2f}, risk={risk_amount:.2f}, sl_pips={sl_pips:.1f}, raw_lot={raw_lot:.4f}, lot={lot:.2f}")
+        step_text = f"{volume_step:.8f}".rstrip("0")
+        step_decimals = len(step_text.split(".")[1]) if "." in step_text else 0
+        lot = round(lot, step_decimals)
+
+        logger.debug(
+            "Lot calc: balance=%.2f risk=%.2f sl_distance=%.5f tick_size=%.5f "
+            "tick_value=%.5f loss_per_lot=%.2f raw_lot=%.4f lot=%.2f",
+            balance, risk_amount, sl_distance, tick_size, tick_value,
+            loss_per_lot, raw_lot, lot,
+        )
         return lot
 
-    def check_daily_limits(self) -> tuple[bool, str]:
+    def check_daily_limits(self) -> Tuple[bool, str]:
         """Return (can_trade, reason). Checks daily loss and consecutive loss limits."""
         if self._session_start_balance and self._daily_loss > 0:
             daily_loss_pct = self._daily_loss / self._session_start_balance

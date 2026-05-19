@@ -92,6 +92,8 @@ class Dashboard:
         self._on_stop      = on_stop
         self._on_close_all = on_close_all
         self._q: queue.Queue = queue.Queue()
+        self._ui_q: queue.Queue = queue.Queue()
+        self._ui_thread_id = threading.get_ident()
 
         self.root = tk.Tk()
         self.root.title("XAUUSD Scalping Bot")
@@ -101,6 +103,7 @@ class Dashboard:
 
         self._setup_styles()
         self._build()
+        self._poll_ui()
         self._poll_log()
 
     # ─── ttk styles ──────────────────────────────────────────────────────────
@@ -433,67 +436,85 @@ class Dashboard:
         btn.bind("<Leave>", leave)
         return btn
 
+    def _run_on_ui(self, fn):
+        if threading.get_ident() == self._ui_thread_id:
+            fn()
+        else:
+            self._ui_q.put(fn)
+
     # ─── Public updaters ──────────────────────────────────────────────────────
 
     def update_connection(self, connected: bool):
-        self._lbl_conn.config(
-            text="● CONNECTED" if connected else "● DISCONNECTED",
-            fg=C["green"] if connected else C["red"],
-        )
+        def _apply():
+            self._lbl_conn.config(
+                text="● CONNECTED" if connected else "● DISCONNECTED",
+                fg=C["green"] if connected else C["red"],
+            )
+        self._run_on_ui(_apply)
 
     def update_state(self, state: str):
-        self._lbl_state.config(text=f"● {state}", fg=C.get(state, C["text"]))
-        self._state_val.config(text=state, fg=C.get(state, C["text"]))
+        def _apply():
+            self._lbl_state.config(text=f"● {state}", fg=C.get(state, C["text"]))
+            self._state_val.config(text=state, fg=C.get(state, C["text"]))
+        self._run_on_ui(_apply)
 
     def update_session(self, name: str):
-        if name == "CLOSED":
-            self._lbl_session.config(text="○ MARKET CLOSED", fg=C["muted"])
-        else:
-            self._lbl_session.config(text=f"◉ {name.upper()}", fg=C["green"])
+        def _apply():
+            if name == "CLOSED":
+                self._lbl_session.config(text="○ MARKET CLOSED", fg=C["muted"])
+            else:
+                self._lbl_session.config(text=f"◉ {name.upper()}", fg=C["green"])
+        self._run_on_ui(_apply)
 
     def update_time(self, utc_time: datetime):
-        self._lbl_time.config(text=utc_time.strftime("%H:%M:%S UTC"))
+        def _apply():
+            self._lbl_time.config(text=utc_time.strftime("%H:%M:%S UTC"))
+        self._run_on_ui(_apply)
 
     def update_account(self, balance: float, equity: float,
                         daily_pnl: float, consec_losses: int):
-        self._bal_val.config(text=f"${balance:,.2f}", fg=C["text"])
-        self._eq_val.config(text=f"${equity:,.2f}", fg=C["text"])
-        self._pnl_val.config(text=f"${daily_pnl:+,.2f}",
-                              fg=C["green"] if daily_pnl >= 0 else C["red"])
-        lc = C["red"] if consec_losses >= 2 else C["yellow"] if consec_losses == 1 else C["text"]
-        self._loss_val.config(text=f"{consec_losses} / 3", fg=lc)
+        def _apply():
+            self._bal_val.config(text=f"${balance:,.2f}", fg=C["text"])
+            self._eq_val.config(text=f"${equity:,.2f}", fg=C["text"])
+            self._pnl_val.config(text=f"${daily_pnl:+,.2f}",
+                                  fg=C["green"] if daily_pnl >= 0 else C["red"])
+            lc = C["red"] if consec_losses >= 2 else C["yellow"] if consec_losses == 1 else C["text"]
+            self._loss_val.config(text=f"{consec_losses} / 3", fg=lc)
+        self._run_on_ui(_apply)
 
     def update_indicators(self, data: dict):
-        self._box_ema8["v"].config( text=f"{data.get('ema_fast',   0):,.2f}", fg=C["text"])
-        self._box_ema13["v"].config(text=f"{data.get('ema_medium', 0):,.2f}", fg=C["text"])
-        self._box_ema21["v"].config(text=f"{data.get('ema_slow',   0):,.2f}", fg=C["text"])
+        def _apply():
+            self._box_ema8["v"].config( text=f"{data.get('ema_fast',   0):,.2f}", fg=C["text"])
+            self._box_ema13["v"].config(text=f"{data.get('ema_medium', 0):,.2f}", fg=C["text"])
+            self._box_ema21["v"].config(text=f"{data.get('ema_slow',   0):,.2f}", fg=C["text"])
 
-        rsi = data.get("rsi", 50)
-        rsi_c = C["red"] if rsi > 70 else C["green"] if rsi < 30 else C["text"]
-        self._box_rsi["v"].config(text=f"{rsi:.1f}", fg=rsi_c)
-        self._box_atr["v"].config(text=f"{data.get('atr', 0):.3f}", fg=C["text"])
+            rsi = data.get("rsi", 50)
+            rsi_c = C["red"] if rsi > 70 else C["green"] if rsi < 30 else C["text"]
+            self._box_rsi["v"].config(text=f"{rsi:.1f}", fg=rsi_c)
+            self._box_atr["v"].config(text=f"{data.get('atr', 0):.3f}", fg=C["text"])
 
-        spread = data.get("spread", 0)
-        self._spread_val.config(text=f"{spread:.0f} pts",
-                                 fg=C["red"] if spread > 25 else C["green"])
-        self._atr_val.config(text=f"{data.get('atr', 0):.3f}", fg=C["text"])
-        price = data.get("price", 0)
-        if price:
-            self._price_val.config(text=f"{price:,.2f}", fg=C["text"])
+            spread = data.get("spread", 0)
+            self._spread_val.config(text=f"{spread:.0f} pts",
+                                     fg=C["red"] if spread > 25 else C["green"])
+            self._atr_val.config(text=f"{data.get('atr', 0):.3f}", fg=C["text"])
+            price = data.get("price", 0)
+            if price:
+                self._price_val.config(text=f"{price:,.2f}", fg=C["text"])
 
-        direction = data.get("direction", "NEUTRAL")
-        if direction == "LONG":
-            self._box_sig["v"].config(text="▲ LONG", fg=C["green"])
-            self._box_sig["inn"].config(bg=C["green_bg"])
-            self._signal_val.config(text="▲ LONG", fg=C["green"])
-        elif direction == "SHORT":
-            self._box_sig["v"].config(text="▼ SHORT", fg=C["red"])
-            self._box_sig["inn"].config(bg=C["red_bg"])
-            self._signal_val.config(text="▼ SHORT", fg=C["red"])
-        else:
-            self._box_sig["v"].config(text="— WAIT", fg=C["muted"])
-            self._box_sig["inn"].config(bg=C["input"])
-            self._signal_val.config(text="— WAIT", fg=C["muted"])
+            direction = data.get("direction", "NEUTRAL")
+            if direction == "LONG":
+                self._box_sig["v"].config(text="▲ LONG", fg=C["green"])
+                self._box_sig["inn"].config(bg=C["green_bg"])
+                self._signal_val.config(text="▲ LONG", fg=C["green"])
+            elif direction == "SHORT":
+                self._box_sig["v"].config(text="▼ SHORT", fg=C["red"])
+                self._box_sig["inn"].config(bg=C["red_bg"])
+                self._signal_val.config(text="▼ SHORT", fg=C["red"])
+            else:
+                self._box_sig["v"].config(text="— WAIT", fg=C["muted"])
+                self._box_sig["inn"].config(bg=C["input"])
+                self._signal_val.config(text="— WAIT", fg=C["muted"])
+        self._run_on_ui(_apply)
 
     def update_price(self, bid: float, ask: float, spread: float):
         price = (bid + ask) / 2
@@ -503,37 +524,48 @@ class Dashboard:
             self._price_val.config(text=f"{price:,.2f}", fg=C["text"])
             self._spread_val.config(text=f"{spread:.0f} pts", fg=spread_color)
 
-        self.root.after(0, _apply)
+        self._run_on_ui(_apply)
 
     def update_filters(self, filters: dict):
-        for key, w in self._fw.items():
-            ok = bool(filters.get(key, False))
-            bg = C["green_bg"] if ok else C["input"]
-            dot_c = C["green"] if ok else C["muted"]
-            nl_c  = C["green"] if ok else C["sub"]
-            w["inn"].config(bg=bg)
-            w["dot"].config(fg=dot_c, bg=bg)
-            w["nl"].config( fg=nl_c,  bg=bg)
-            w["tl"].config( bg=bg)
-            w["lf"].config( bg=bg)
+        def _apply():
+            for key, w in self._fw.items():
+                ok = bool(filters.get(key, False))
+                bg = C["green_bg"] if ok else C["input"]
+                dot_c = C["green"] if ok else C["muted"]
+                nl_c  = C["green"] if ok else C["sub"]
+                w["inn"].config(bg=bg)
+                w["dot"].config(fg=dot_c, bg=bg)
+                w["nl"].config( fg=nl_c,  bg=bg)
+                w["tl"].config( bg=bg)
+                w["lf"].config( bg=bg)
+        self._run_on_ui(_apply)
 
     def update_positions(self, trades: list):
-        for item in self._tree.get_children():
-            self._tree.delete(item)
-        self._trades_val.config(text=str(len(trades)), fg=C["text"])
+        rows = []
         for t in trades:
             tag = "long" if t.direction == "LONG" else "short"
-            self._tree.insert("", "end", tags=(tag,), values=(
-                t.ticket,
-                "▲ BUY" if t.direction == "LONG" else "▼ SELL",
-                f"{t.lot_remaining:.2f}",
-                f"{t.entry_price:.2f}",
-                f"{t.sl:.2f}",
-                f"{t.tp1:.2f}",
-                f"{t.tp2:.2f}",
-                f"{t.tp3:.2f}",
-                "--",
+            rows.append((
+                tag,
+                (
+                    t.ticket,
+                    "▲ BUY" if t.direction == "LONG" else "▼ SELL",
+                    f"{t.lot_remaining:.2f}",
+                    f"{t.entry_price:.2f}",
+                    f"{t.sl:.2f}",
+                    f"{t.tp1:.2f}",
+                    f"{t.tp2:.2f}",
+                    f"{t.tp3:.2f}",
+                    f"${t.realized_pnl:+,.2f}" if t.realized_pnl else "--",
+                ),
             ))
+
+        def _apply():
+            for item in self._tree.get_children():
+                self._tree.delete(item)
+            self._trades_val.config(text=str(len(rows)), fg=C["text"])
+            for tag, values in rows:
+                self._tree.insert("", "end", tags=(tag,), values=values)
+        self._run_on_ui(_apply)
 
     def update_position_pnl(self, pnls: dict):
         """Update only the P&L column for open positions (ticket → pnl map)."""
@@ -550,36 +582,47 @@ class Dashboard:
                     new_vals = list(vals)
                     new_vals[8] = f"${pnls[ticket]:+,.2f}"
                     self._tree.item(item, values=new_vals)
-        self.root.after(0, _apply)
+        self._run_on_ui(_apply)
 
     def update_performance(self, stats: dict):
         """Update the today's performance strip with stats from RiskManager."""
-        pnl   = stats.get("total_pnl",    0.0)
-        total = stats.get("total_trades",  0)
-        wins  = stats.get("wins",          0)
-        loss  = stats.get("losses",        0)
-        wr    = stats.get("win_rate",      0.0)
-        best  = stats.get("best_trade",    0.0)
-        worst = stats.get("worst_trade",   0.0)
-        avg   = stats.get("avg_trade",     0.0)
+        def _apply():
+            pnl   = stats.get("total_pnl",    0.0)
+            total = stats.get("total_trades",  0)
+            wins  = stats.get("wins",          0)
+            loss  = stats.get("losses",        0)
+            wr    = stats.get("win_rate",      0.0)
+            best  = stats.get("best_trade",    0.0)
+            worst = stats.get("worst_trade",   0.0)
+            avg   = stats.get("avg_trade",     0.0)
 
-        pnl_color = C["green"] if pnl > 0 else C["red"] if pnl < 0 else C["sub"]
-        self._perf_pnl.config(    text=f"${pnl:+,.2f}",  fg=pnl_color)
-        self._perf_trades.config( text=str(total),         fg=C["text"])
-        self._perf_wins.config(   text=str(wins),          fg=C["green"] if wins > 0 else C["muted"])
-        self._perf_losses.config( text=str(loss),          fg=C["red"]   if loss > 0 else C["muted"])
-        self._perf_winrate.config(text=f"{wr:.1f}%",
-                                   fg=C["green"] if wr >= 50 else C["red"] if wr > 0 else C["muted"])
-        self._perf_best.config(   text=f"${best:+,.2f}",  fg=C["green"] if best > 0 else C["muted"])
-        self._perf_worst.config(  text=f"${worst:+,.2f}", fg=C["red"]   if worst < 0 else C["muted"])
-        avg_c = C["green"] if avg > 0 else C["red"] if avg < 0 else C["sub"]
-        self._perf_avg.config(    text=f"${avg:+,.2f}",   fg=avg_c)
+            pnl_color = C["green"] if pnl > 0 else C["red"] if pnl < 0 else C["sub"]
+            self._perf_pnl.config(    text=f"${pnl:+,.2f}",  fg=pnl_color)
+            self._perf_trades.config( text=str(total),         fg=C["text"])
+            self._perf_wins.config(   text=str(wins),          fg=C["green"] if wins > 0 else C["muted"])
+            self._perf_losses.config( text=str(loss),          fg=C["red"]   if loss > 0 else C["muted"])
+            self._perf_winrate.config(text=f"{wr:.1f}%",
+                                       fg=C["green"] if wr >= 50 else C["red"] if wr > 0 else C["muted"])
+            self._perf_best.config(   text=f"${best:+,.2f}",  fg=C["green"] if best > 0 else C["muted"])
+            self._perf_worst.config(  text=f"${worst:+,.2f}", fg=C["red"]   if worst < 0 else C["muted"])
+            avg_c = C["green"] if avg > 0 else C["red"] if avg < 0 else C["sub"]
+            self._perf_avg.config(    text=f"${avg:+,.2f}",   fg=avg_c)
+        self._run_on_ui(_apply)
 
     def log(self, message: str, level: str = "INFO"):
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self._q.put((ts, message, level))
 
     # ─── Internal ─────────────────────────────────────────────────────────────
+
+    def _poll_ui(self):
+        try:
+            while not self._ui_q.empty():
+                fn = self._ui_q.get_nowait()
+                fn()
+        except Exception:
+            pass
+        self.root.after(50, self._poll_ui)
 
     def _poll_log(self):
         try:

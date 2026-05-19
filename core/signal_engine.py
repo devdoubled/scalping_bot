@@ -106,6 +106,30 @@ class SignalEngine:
     def __init__(self, config: dict):
         self.cfg = config
 
+    def _attach_price_levels(
+        self,
+        result: Dict[str, Any],
+        price: float,
+        atr: float,
+        direction: str,
+        min_sl_distance: float = 0.0,
+    ) -> Dict[str, Any]:
+        sl_dist = max(atr * self.cfg["atr_sl_multiplier"], min_sl_distance)
+
+        if direction == LONG:
+            result["sl"] = price - sl_dist
+            result["tp1"] = price + sl_dist * self.cfg["tp1_multiplier"]
+            result["tp2"] = price + sl_dist * self.cfg["tp2_multiplier"]
+            result["tp3"] = price + sl_dist * self.cfg["tp3_multiplier"]
+        else:
+            result["sl"] = price + sl_dist
+            result["tp1"] = price - sl_dist * self.cfg["tp1_multiplier"]
+            result["tp2"] = price - sl_dist * self.cfg["tp2_multiplier"]
+            result["tp3"] = price - sl_dist * self.cfg["tp3_multiplier"]
+
+        result["sl_distance"] = sl_dist
+        return result
+
     def analyse(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Run all indicator calculations on the OHLCV dataframe.
@@ -199,27 +223,49 @@ class SignalEngine:
 
         if all_pass and direction != NEUTRAL:
             atr = data["atr"]
-            sl_dist = atr * self.cfg["atr_sl_multiplier"]
             price = data["close"]
-
-            if direction == LONG:
-                sl = price - sl_dist
-                tp1 = price + sl_dist * self.cfg["tp1_multiplier"]
-                tp2 = price + sl_dist * self.cfg["tp2_multiplier"]
-                tp3 = price + sl_dist * self.cfg["tp3_multiplier"]
-            else:
-                sl = price + sl_dist
-                tp1 = price - sl_dist * self.cfg["tp1_multiplier"]
-                tp2 = price - sl_dist * self.cfg["tp2_multiplier"]
-                tp3 = price - sl_dist * self.cfg["tp3_multiplier"]
-
-            result["sl"] = sl
-            result["tp1"] = tp1
-            result["tp2"] = tp2
-            result["tp3"] = tp3
-            result["sl_distance"] = sl_dist
+            self._attach_price_levels(result, price, atr, direction)
 
         return result
+
+    def get_forced_signal(self, df: pd.DataFrame, spread: float, preferred_direction: str = "AUTO") -> Dict[str, Any]:
+        """
+        Build a paper-test signal that always has executable price levels.
+        This is intended for paper-mode flow testing only, not live trading edge.
+        """
+        data = self.analyse(df)
+        preferred_direction = (preferred_direction or "AUTO").upper()
+
+        if preferred_direction in (LONG, SHORT):
+            direction = preferred_direction
+        elif data["alignment"] == BEARISH:
+            direction = SHORT
+        else:
+            direction = LONG
+
+        filters = {
+            "atr_active": True,
+            "spread_ok": True,
+            "ema_aligned": True,
+            "slope_ok": True,
+            "pullback": True,
+            "rsi_zone": True,
+            "candle_confirm": True,
+        }
+        result = {
+            "direction": direction,
+            "filters": filters,
+            "all_pass": True,
+            "forced": True,
+            **{k: v for k, v in data.items() if k not in ("ema_fast_series", "ema_medium_series", "ema_slow_series", "df")},
+        }
+        return self._attach_price_levels(
+            result,
+            data["close"],
+            data["atr"],
+            direction,
+            self.cfg.get("forced_min_sl_distance", 0.5),
+        )
 
     def check_ema_reversal(self, df: pd.DataFrame, trade_direction: str) -> bool:
         """True if EMA8 has crossed EMA13 against the trade direction (exit signal)."""

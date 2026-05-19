@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+
+.env
+.env.*
+mt5_credentials.json
+
+logs/*.log
+!logs/.gitkeep

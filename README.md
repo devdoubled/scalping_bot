@@ -121,6 +121,9 @@ Open `config.json` and review the settings:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `paper_mode` | `true` | `true` = simulate orders (no real trades). Set to `false` for live/demo trading |
+| `entry_confirmation_ticks` | `1` | `1` = enter immediately when a valid signal appears; higher values require repeated confirmation |
+| `paper_force_entry` | `true` | Paper-only test mode: create a forced paper signal when normal filters do not pass |
+| `paper_auto_take_profit` | `true` | Paper-only test mode: simulate price reaching TP so TP handling can be verified |
 | `risk_percent` | `1.0` | % of balance risked per trade |
 | `max_daily_loss_percent` | `3.0` | Bot stops for the day at this loss threshold |
 | `max_consecutive_losses` | `3` | Bot stops after this many losses in a row |

@@ -8,6 +8,15 @@
   "max_daily_loss_percent": 3.0,
   "max_consecutive_losses": 3,
   "max_concurrent_positions": 2,
+  "entry_confirmation_ticks": 1,
+
+  "paper_force_entry": true,
+  "paper_force_direction": "AUTO",
+  "paper_force_once_per_start": true,
+  "paper_force_ignore_session": true,
+  "paper_auto_take_profit": true,
+  "paper_auto_take_profit_after_seconds": 5,
+  "forced_min_sl_distance": 0.5,
 
   "ema_fast": 8,
   "ema_medium": 13,
@@ -36,8 +45,7 @@
   "ema_slope_min": 0.0001,
 
   "sessions": [
-    {"name": "London", "start_utc": "07:00", "end_utc": "12:00"},
-    {"name": "NY_Overlap", "start_utc": "12:00", "end_utc": "16:00"}
+    {"name": "All_Day", "start_utc": "00:00", "end_utc": "23:59"}
   ],
 
   "polling_interval_scan_ms": 5000,

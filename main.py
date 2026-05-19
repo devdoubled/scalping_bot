@@ -58,6 +58,7 @@ class ScalpingBot:
         self._cooling_bars = 0
         self._last_signal: dict = {}
         self._dashboard: Dashboard = None
+        self._paper_forced_trade_done = False
 
         self._symbol_info: dict = {}
 
@@ -69,17 +70,21 @@ class ScalpingBot:
         # Reuse existing connection from auto-connect; only connect if not already connected
         if not self.connector.is_connected():
             connected = self.connector.connect()
-            if not connected and not self.paper_mode:
-                self._log("Failed to connect to MT5. Check credentials and MT5 terminal.", "ERROR")
+            if not connected:
+                mode_note = " Paper mode still needs MT5 market data." if self.paper_mode else ""
+                self._log(f"Failed to connect to MT5. Check credentials and MT5 terminal.{mode_note}", "ERROR")
                 return
 
         if self.trade_manager is None:
             self.trade_manager = TradeManager(self.cfg, self.connector, self.risk_manager)
         if not self._symbol_info:
             self._symbol_info = self.connector.get_symbol_info(self.symbol) or {
-                "trade_tick_value": 0.01,
+                "trade_tick_value": 1.0,
+                "trade_tick_size": 0.01,
                 "volume_step": 0.01,
                 "volume_min": 0.01,
+                "volume_max": 100.0,
+                "trade_contract_size": 100.0,
             }
 
         acc = self.connector.get_account_info()
@@ -88,6 +93,7 @@ class ScalpingBot:
 
         self._state = STATE_SCANNING
         self._running = True
+        self._paper_forced_trade_done = False
         self._update_dashboard_state()
         self._log(f"Bot started | Symbol: {self.symbol} | Mode: {'PAPER' if self.paper_mode else 'LIVE'}", "INFO")
 
@@ -103,6 +109,8 @@ class ScalpingBot:
     def emergency_close_all(self):
         if self.trade_manager:
             self.trade_manager.close_all()
+            if self._dashboard:
+                self._dashboard.update_positions(self.trade_manager.get_trades())
         self._log("Emergency close all executed.", "WARN")
 
     def _loop(self):
@@ -160,9 +168,13 @@ class ScalpingBot:
             if tick:
                 price = (tick["bid"] + tick["ask"]) / 2
                 df = self.connector.get_ohlcv(self.symbol, self.cfg["timeframe"], self.cfg["ohlcv_bars"])
-                events = self.trade_manager.monitor(price, df, self.signal_engine)
+                trades = self.trade_manager.get_trades()
+                price_by_ticket = self._closeable_prices_by_ticket(trades, tick)
+                price_by_ticket.update(self._paper_auto_tp_prices(trades))
+                events = self.trade_manager.monitor(price, df, self.signal_engine, price_by_ticket=price_by_ticket)
                 for ev in events:
-                    self._log(f"Trade event: {ev['type']} ticket={ev['ticket']}", "TRADE")
+                    pnl = f" pnl={ev['pnl']:+.2f}" if "pnl" in ev else ""
+                    self._log(f"Trade event: {ev['type']} ticket={ev['ticket']}{pnl}", "TRADE")
 
                 if self._dashboard:
                     self._dashboard.update_positions(self.trade_manager.get_trades())
@@ -172,7 +184,14 @@ class ScalpingBot:
             return
 
         # ── SESSION GATE ──────────────────────────────────────────────
+        force_entry_available = self._paper_force_entry_available()
         if not is_trading_session(now, self.cfg["sessions"]):
+            if not (force_entry_available and self.cfg.get("paper_force_ignore_session", True)):
+                return
+            self._log("Paper force entry bypassing session gate for test trade.", "WARN")
+
+        # Do not open a new test trade while a managed trade is active.
+        if force_entry_available and self.trade_manager and self.trade_manager.trade_count() > 0:
             return
 
         # ── DAILY LIMIT CHECK ─────────────────────────────────────────
@@ -180,6 +199,7 @@ class ScalpingBot:
         if not can_trade:
             self._log(f"Trading halted: {reason}", "WARN")
             self._state = STATE_STOPPED
+            self._running = False
             self._update_dashboard_state()
             return
 
@@ -196,6 +216,13 @@ class ScalpingBot:
             return
 
         signal = self.signal_engine.get_signal(df, spread)
+        if signal.get("direction", NEUTRAL) == NEUTRAL and force_entry_available:
+            signal = self.signal_engine.get_forced_signal(
+                df,
+                spread,
+                self.cfg.get("paper_force_direction", "AUTO"),
+            )
+            self._log(f"Paper forced signal generated: {signal['direction']}", "WARN")
         self._last_signal = signal
 
         if self._dashboard:
@@ -225,6 +252,8 @@ class ScalpingBot:
             self._state = STATE_ENTRY_READY
             self._update_dashboard_state()
             self._log(f"Entry ready: {direction} | RSI={signal['rsi']:.1f} | ATR={signal['atr']:.2f}", "INFO")
+            if signal.get("forced") or self.cfg.get("entry_confirmation_ticks", 1) <= 1:
+                self._execute_entry(signal, acc)
             return
 
         if self._state == STATE_ENTRY_READY:
@@ -237,12 +266,22 @@ class ScalpingBot:
         tp3 = signal["tp3"]
 
         balance = acc["balance"] if acc else 10000.0
-        tick_value = self._symbol_info.get("trade_tick_value", 0.01)
+        tick_value = self._symbol_info.get("trade_tick_value", 1.0)
+        tick_size = self._symbol_info.get("trade_tick_size", 0.01)
         volume_step = self._symbol_info.get("volume_step", 0.01)
+        volume_min = self._symbol_info.get("volume_min", 0.01)
+        volume_max = self._symbol_info.get("volume_max")
         sl_distance = signal["sl_distance"]
 
-        lot = self.risk_manager.calculate_lot_size(balance, sl_distance, tick_value, volume_step)
-        lot = max(lot, self._symbol_info.get("volume_min", 0.01))
+        lot = self.risk_manager.calculate_lot_size(
+            balance,
+            sl_distance,
+            tick_value,
+            volume_step,
+            tick_size,
+            volume_min,
+            volume_max,
+        )
 
         self._log(f"Entering {direction} | Lot={lot:.2f} | SL={sl:.2f} | TP3={tp3:.2f}", "TRADE")
 
@@ -266,8 +305,13 @@ class ScalpingBot:
             tp1=signal["tp1"],
             tp2=signal["tp2"],
             tp3=tp3,
+            tick_size=tick_size,
+            tick_value=tick_value,
+            contract_size=self._symbol_info.get("trade_contract_size", 100.0),
         )
         self.trade_manager.add_trade(trade)
+        if signal.get("forced"):
+            self._paper_forced_trade_done = True
 
         self._state = STATE_IN_TRADE
         self._update_dashboard_state()
@@ -276,6 +320,9 @@ class ScalpingBot:
             self._dashboard.update_positions(self.trade_manager.get_trades())
 
     def _sync_positions(self):
+        if self.paper_mode:
+            return
+
         open_tickets = {p.ticket for p in self.connector.get_open_positions(self.symbol, self.magic)}
         managed_tickets = {t.ticket for t in self.trade_manager.get_trades()}
 
@@ -285,6 +332,31 @@ class ScalpingBot:
             exit_price = (tick["bid"] + tick["ask"]) / 2 if tick else 0
             self.trade_manager.handle_sl_hit(ticket, exit_price)
             self._log(f"SL hit detected: ticket={ticket}", "WARN")
+
+    def _paper_force_entry_available(self) -> bool:
+        if not self.paper_mode or not self.cfg.get("paper_force_entry", False):
+            return False
+        if self.cfg.get("paper_force_once_per_start", True) and self._paper_forced_trade_done:
+            return False
+        return True
+
+    def _closeable_prices_by_ticket(self, trades, tick: dict) -> dict:
+        prices = {}
+        for trade in trades:
+            prices[trade.ticket] = tick["bid"] if trade.direction == "LONG" else tick["ask"]
+        return prices
+
+    def _paper_auto_tp_prices(self, trades) -> dict:
+        if not self.paper_mode or not self.cfg.get("paper_auto_take_profit", False):
+            return {}
+
+        delay = float(self.cfg.get("paper_auto_take_profit_after_seconds", 5))
+        now = time.time()
+        prices = {}
+        for trade in trades:
+            if now - trade.opened_at >= delay:
+                prices[trade.ticket] = trade.tp3
+        return prices
 
     def _start_price_ticker(self):
         def _ticker():
@@ -349,9 +421,12 @@ def main():
                 bot.risk_manager.set_session_balance(acc["balance"])
                 bot.trade_manager = TradeManager(cfg, bot.connector, bot.risk_manager)
                 bot._symbol_info = bot.connector.get_symbol_info(bot.symbol) or {
-                    "trade_tick_value": 0.01,
+                    "trade_tick_value": 1.0,
+                    "trade_tick_size": 0.01,
                     "volume_step": 0.01,
                     "volume_min": 0.01,
+                    "volume_max": 100.0,
+                    "trade_contract_size": 100.0,
                 }
                 mode_tag = " | ⚠ PAPER MODE — no real orders" if cfg.get("paper_mode") else " | LIVE TRADING"
                 dashboard.log(
@@ -362,7 +437,11 @@ def main():
                 bot._start_price_ticker()
         else:
             dashboard.update_connection(False)
-            dashboard.log("MT5 connection failed. Check mt5_credentials.json and ensure MT5 terminal is running.", "ERROR")
+            mode_note = " Paper mode still needs MT5 market data." if cfg.get("paper_mode") else ""
+            dashboard.log(
+                f"MT5 connection failed. Check mt5_credentials.json and ensure MT5 terminal is running.{mode_note}",
+                "ERROR",
+            )
 
     # Auto-connect in background thread after GUI is shown
     dashboard.schedule(500, lambda: threading.Thread(target=auto_connect, daemon=True).start())

@@ -176,6 +176,10 @@ class ScalpingBot:
         if not is_trading_session(now, self.cfg["sessions"]):
             return
 
+        # Already halted — don't re-scan or re-log every tick
+        if self._state == STATE_STOPPED:
+            return
+
         # ── DAILY LIMIT CHECK ─────────────────────────────────────────
         can_trade, reason = self.risk_manager.check_daily_limits()
         if not can_trade:
@@ -203,13 +207,16 @@ class ScalpingBot:
             tick = self.connector.get_current_price(self.symbol)
             price = (tick["bid"] + tick["ask"]) / 2 if tick else 0
             self._dashboard.update_indicators({
-                "ema_fast": signal.get("ema_fast", 0),
-                "ema_medium": signal.get("ema_medium", 0),
-                "ema_slow": signal.get("ema_slow", 0),
-                "rsi": signal.get("rsi", 50),
-                "atr": signal.get("atr", 0),
-                "spread": spread,
-                "price": price,
+                "ema_fast":  signal.get("ema_fast", 0),
+                "ema_medium":signal.get("ema_medium", 0),
+                "ema_slow":  signal.get("ema_slow", 0),
+                "rsi":       signal.get("rsi", 50),
+                "atr":       signal.get("atr", 0),
+                "adx":       signal.get("adx", 0),
+                "plus_di":   signal.get("plus_di", 0),
+                "minus_di":  signal.get("minus_di", 0),
+                "spread":    spread,
+                "price":     price,
                 "direction": signal.get("direction", "NEUTRAL"),
             })
             self._dashboard.update_filters(signal.get("filters", {}))
@@ -225,7 +232,12 @@ class ScalpingBot:
         if self._state == STATE_SCANNING:
             self._state = STATE_ENTRY_READY
             self._update_dashboard_state()
-            self._log(f"Entry ready: {direction} | RSI={signal['rsi']:.1f} | ATR={signal['atr']:.2f}", "INFO")
+            self._log(
+                f"Entry ready: {direction} | RSI={signal['rsi']:.1f} | "
+                f"ATR={signal['atr']:.2f} | ADX={signal.get('adx', 0):.1f} "
+                f"(+DI={signal.get('plus_di', 0):.1f} -DI={signal.get('minus_di', 0):.1f})",
+                "INFO",
+            )
             return
 
         if self._state == STATE_ENTRY_READY:

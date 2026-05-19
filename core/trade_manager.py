@@ -80,7 +80,23 @@ class TradeManager:
                 logger.info(f"TP1 hit ticket={trade.ticket} closed={close_vol:.2f}L remaining={trade.lot_remaining:.2f}L")
                 events.append({"type": "TP1", "ticket": trade.ticket, "volume": close_vol})
 
-        # TP2 + breakeven
+        # Early breakeven: move SL to entry once price moves early_breakeven_r × sl_dist
+        early_be_r = self.cfg.get("early_breakeven_r", 0.0)
+        if early_be_r > 0 and not trade.breakeven_set:
+            sl_dist = abs(trade.entry_price - trade.sl)
+            trigger_dist = sl_dist * early_be_r
+            in_profit = (
+                (direction == "LONG"  and price >= trade.entry_price + trigger_dist) or
+                (direction == "SHORT" and price <= trade.entry_price - trigger_dist)
+            )
+            if in_profit:
+                if self.connector.modify_sl(trade.ticket, trade.entry_price):
+                    trade.sl = trade.entry_price
+                    trade.breakeven_set = True
+                    logger.info(f"Early breakeven ticket={trade.ticket} SL→{trade.entry_price:.2f} (price={price:.2f})")
+                    events.append({"type": "BREAKEVEN", "ticket": trade.ticket})
+
+        # TP2 + breakeven (fallback if early BE not triggered)
         if trade.tp1_hit and not trade.tp2_hit and self._tp_hit(price, trade.tp2, direction):
             close_vol = self._partial_volume(trade, self.cfg["tp2_close_percent"])
             if close_vol > 0 and self.connector.close_partial(trade.ticket, close_vol, symbol, direction):

@@ -46,13 +46,15 @@ F_MONO = "Consolas"
 F_UI   = "Segoe UI"
 
 FILTERS = {
-    "atr_active":     ("ATR Active",      "Market volatility OK"),
-    "spread_ok":      ("Spread OK",       "Below 30 pts limit"),
-    "ema_aligned":    ("EMA Stack",       "8 > 13 > 21 aligned"),
-    "slope_ok":       ("EMA Slope",       "Trend is steep enough"),
-    "pullback":       ("Pullback",        "Price retraced to EMA"),
-    "rsi_zone":       ("RSI Zone",        "45-65 long / 35-55 short"),
-    "candle_confirm": ("Candle Confirm",  "Body > 50% of range"),
+    "atr_active":     ("ATR Range",        "Volatility 0.5–8.0 range"),
+    "spread_ok":      ("Spread OK",        "Below 30 pts limit"),
+    "ema_aligned":    ("EMA Stack",        "8 > 13 > 21 aligned"),
+    "slope_ok":       ("EMA Slope",        "Trend steep ≥ 0.10/bar"),
+    "pullback":       ("Pullback",         "Touch EMA within 2 bars"),
+    "rsi_zone":       ("RSI Zone",         "52-68 long / 32-48 short"),
+    "candle_confirm": ("Candle Confirm",   "Body > 50% of range"),
+    "adx_trending":   ("ADX Strength",     "ADX>25 & DI confirmed"),
+    "rsi_trending":   ("RSI Trending",     "RSI moving with signal"),
 }
 
 
@@ -279,10 +281,11 @@ class Dashboard:
         self._box_ema21 = self._ind_box(strip, "EMA 21",  "--")
         self._box_rsi   = self._ind_box(strip, "RSI (14)","--")
         self._box_atr   = self._ind_box(strip, "ATR (14)","--")
+        self._box_adx   = self._ind_box(strip, "ADX (14)","--", wide=True)
         self._box_sig   = self._ind_box(strip, "Signal",  "--", wide=True)
 
         for box in (self._box_ema8, self._box_ema13, self._box_ema21,
-                    self._box_rsi, self._box_atr, self._box_sig):
+                    self._box_rsi, self._box_atr, self._box_adx, self._box_sig):
             box["f"].pack(side="left", padx=(0, 6))
 
         # Row 3: Filters + Controls side by side
@@ -294,7 +297,7 @@ class Dashboard:
         flt_outer.pack(side="left", fill="both", expand=True, padx=(0, 8))
         flt = tk.Frame(flt_outer, bg=C["card"])
         flt.pack(fill="both", expand=True)
-        self._section_title(flt, "ENTRY FILTERS  —  ALL 7 MUST PASS")
+        self._section_title(flt, "ENTRY FILTERS  —  ALL MUST PASS")
 
         grid = tk.Frame(flt, bg=C["card"])
         grid.pack(fill="x", padx=14, pady=(4, 12))
@@ -350,8 +353,10 @@ class Dashboard:
         for c, w in zip(cols, widths):
             self._tree.heading(c, text=c)
             self._tree.column(c, width=w, anchor="center", minwidth=w)
-        self._tree.tag_configure("long",  foreground=C["green"])
-        self._tree.tag_configure("short", foreground=C["red"])
+        self._tree.tag_configure("long",       foreground=C["green"])
+        self._tree.tag_configure("short",      foreground=C["red"])
+        self._tree.tag_configure("pnl_profit", foreground=C["green"], background=C["green_bg"])
+        self._tree.tag_configure("pnl_loss",   foreground=C["red"],   background=C["red_bg"])
         self._tree.pack(fill="both", expand=True, padx=14, pady=(4, 12))
 
     # ─── Right sidebar (log) ──────────────────────────────────────────────────
@@ -473,6 +478,13 @@ class Dashboard:
         self._box_rsi["v"].config(text=f"{rsi:.1f}", fg=rsi_c)
         self._box_atr["v"].config(text=f"{data.get('atr', 0):.3f}", fg=C["text"])
 
+        adx = data.get("adx", 0)
+        adx_c = C["green"] if adx >= 25 else C["yellow"] if adx >= 20 else C["red"]
+        plus_di  = data.get("plus_di",  0)
+        minus_di = data.get("minus_di", 0)
+        di_str = f"+{plus_di:.0f}/-{minus_di:.0f}"
+        self._box_adx["v"].config(text=f"{adx:.1f}  {di_str}", fg=adx_c)
+
         spread = data.get("spread", 0)
         self._spread_val.config(text=f"{spread:.0f} pts",
                                  fg=C["red"] if spread > 25 else C["green"])
@@ -547,9 +559,11 @@ class Dashboard:
                 except (ValueError, IndexError):
                     continue
                 if ticket in pnls:
+                    pnl_val = pnls[ticket]
                     new_vals = list(vals)
-                    new_vals[8] = f"${pnls[ticket]:+,.2f}"
-                    self._tree.item(item, values=new_vals)
+                    new_vals[8] = f"${pnl_val:+,.2f}"
+                    pnl_tag = "pnl_profit" if pnl_val >= 0 else "pnl_loss"
+                    self._tree.item(item, values=new_vals, tags=(pnl_tag,))
         self.root.after(0, _apply)
 
     def update_performance(self, stats: dict):

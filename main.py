@@ -77,7 +77,8 @@ class ScalpingBot:
             self.trade_manager = TradeManager(self.cfg, self.connector, self.risk_manager)
         if not self._symbol_info:
             self._symbol_info = self.connector.get_symbol_info(self.symbol) or {
-                "trade_tick_value": 0.01,
+                "trade_tick_value": 1.0,
+                "trade_tick_size": 0.01,
                 "volume_step": 0.01,
                 "volume_min": 0.01,
             }
@@ -237,11 +238,12 @@ class ScalpingBot:
         tp3 = signal["tp3"]
 
         balance = acc["balance"] if acc else 10000.0
-        tick_value = self._symbol_info.get("trade_tick_value", 0.01)
+        tick_value = self._symbol_info.get("trade_tick_value", 1.0)   # $ per lot per 1 tick
+        tick_size  = self._symbol_info.get("trade_tick_size", 0.01)   # price units per 1 tick
         volume_step = self._symbol_info.get("volume_step", 0.01)
         sl_distance = signal["sl_distance"]
 
-        lot = self.risk_manager.calculate_lot_size(balance, sl_distance, tick_value, volume_step)
+        lot = self.risk_manager.calculate_lot_size(balance, sl_distance, tick_value, tick_size, volume_step)
         lot = max(lot, self._symbol_info.get("volume_min", 0.01))
 
         if not self.connector.is_algo_trading_enabled():
@@ -355,7 +357,8 @@ def main():
                 bot.risk_manager.set_session_balance(acc["balance"])
                 bot.trade_manager = TradeManager(cfg, bot.connector, bot.risk_manager)
                 bot._symbol_info = bot.connector.get_symbol_info(bot.symbol) or {
-                    "trade_tick_value": 0.01,
+                    "trade_tick_value": 1.0,
+                    "trade_tick_size": 0.01,
                     "volume_step": 0.01,
                     "volume_min": 0.01,
                 }

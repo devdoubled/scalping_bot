@@ -164,6 +164,7 @@ class MT5Connector:
             "volume_step": info.volume_step,
             "volume_max": info.volume_max,
             "trade_tick_value": info.trade_tick_value,
+            "trade_tick_size": info.trade_tick_size,
             "trade_contract_size": info.trade_contract_size,
         }
 

@@ -20,7 +20,7 @@ class RiskManager:
         self.risk_percent = config["risk_percent"] / 100.0
         self.max_daily_loss_pct = config["max_daily_loss_percent"] / 100.0
         self.max_consecutive_losses = config["max_consecutive_losses"]
-        self.max_concurrent_positions = config["max_concurrent_positions"]
+        self.max_concurrent_positions = config.get("max_concurrent_positions", 1)
 
         self._daily_loss = 0.0
         self._daily_profit = 0.0

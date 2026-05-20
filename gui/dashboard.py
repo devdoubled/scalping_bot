@@ -46,15 +46,12 @@ F_MONO = "Consolas"
 F_UI   = "Segoe UI"
 
 FILTERS = {
-    "atr_active":     ("ATR Range",        "Volatility 0.5–8.0 range"),
-    "spread_ok":      ("Spread OK",        "Below 30 pts limit"),
-    "ema_aligned":    ("EMA Stack",        "8 > 13 > 21 aligned"),
-    "slope_ok":       ("EMA Slope",        "Trend steep ≥ 0.10/bar"),
-    "pullback":       ("Pullback",         "Touch EMA within 2 bars"),
-    "rsi_zone":       ("RSI Zone",         "52-68 long / 32-48 short"),
-    "candle_confirm": ("Candle Confirm",   "Body > 50% of range"),
-    "adx_trending":   ("ADX Strength",     "ADX>25 & DI confirmed"),
-    "rsi_trending":   ("RSI Trending",     "RSI moving with signal"),
+    "basket_active": ("Basket",    "Current basket status"),
+    "direction":     ("Direction", "LONG or SHORT"),
+    "levels":        ("Levels",    "Active / Max levels"),
+    "float_pnl":     ("Float PnL", "Running basket P&L"),
+    "next_add":      ("Next Add",  "Price for next DCA level"),
+    "session":       ("Session",   "Active trading session"),
 }
 
 
@@ -271,18 +268,18 @@ class Dashboard:
         ind_outer.pack(fill="x", pady=(8, 0))
         ind = tk.Frame(ind_outer, bg=C["card"])
         ind.pack(fill="both")
-        self._section_title(ind, "INDICATORS")
+        self._section_title(ind, "GRID METRICS")
 
         strip = tk.Frame(ind, bg=C["card"])
         strip.pack(fill="x", padx=14, pady=(4, 12))
 
-        self._box_ema8  = self._ind_box(strip, "EMA 8",   "--")
-        self._box_ema13 = self._ind_box(strip, "EMA 13",  "--")
-        self._box_ema21 = self._ind_box(strip, "EMA 21",  "--")
-        self._box_rsi   = self._ind_box(strip, "RSI (14)","--")
-        self._box_atr   = self._ind_box(strip, "ATR (14)","--")
-        self._box_adx   = self._ind_box(strip, "ADX (14)","--", wide=True)
-        self._box_sig   = self._ind_box(strip, "Signal",  "--", wide=True)
+        self._box_ema8  = self._ind_box(strip, "Level",     "--")
+        self._box_ema13 = self._ind_box(strip, "Direction", "--")
+        self._box_ema21 = self._ind_box(strip, "Avg Entry", "--")
+        self._box_rsi   = self._ind_box(strip, "Float PnL", "--")
+        self._box_atr   = self._ind_box(strip, "Next Add",  "--")
+        self._box_adx   = self._ind_box(strip, "Bail-out",  "--", wide=True)
+        self._box_sig   = self._ind_box(strip, "Target",    "--", wide=True)
 
         for box in (self._box_ema8, self._box_ema13, self._box_ema21,
                     self._box_rsi, self._box_atr, self._box_adx, self._box_sig):
@@ -297,7 +294,7 @@ class Dashboard:
         flt_outer.pack(side="left", fill="both", expand=True, padx=(0, 8))
         flt = tk.Frame(flt_outer, bg=C["card"])
         flt.pack(fill="both", expand=True)
-        self._section_title(flt, "ENTRY FILTERS  —  ALL MUST PASS")
+        self._section_title(flt, "BASKET STATUS")
 
         grid = tk.Frame(flt, bg=C["card"])
         grid.pack(fill="x", padx=14, pady=(4, 12))
@@ -346,8 +343,8 @@ class Dashboard:
         pos.pack(fill="both", expand=True)
         self._section_title(pos, "OPEN POSITIONS")
 
-        cols = ("Ticket", "Direction", "Lots", "Entry", "SL", "TP1", "TP2", "TP3", "P&L")
-        widths = [75, 70, 55, 76, 76, 76, 76, 76, 76]
+        cols = ("Lvl", "Ticket", "Direction", "Lots", "Entry", "Avg Entry", "P&L")
+        widths = [36, 90, 72, 55, 85, 85, 90]
         self._tree = ttk.Treeview(pos, columns=cols, show="headings",
                                    height=4, style="T.Treeview")
         for c, w in zip(cols, widths):
@@ -396,12 +393,13 @@ class Dashboard:
         f = tk.Frame(parent, bg=C["border"], padx=1, pady=1, width=w)
         inn = tk.Frame(f, bg=C["input"], padx=10, pady=8)
         inn.pack(fill="both")
-        tk.Label(inn, text=label, bg=C["input"], fg=C["muted"],
-                 font=(F_UI, 7, "bold")).pack(anchor="w")
+        t = tk.Label(inn, text=label, bg=C["input"], fg=C["muted"],
+                     font=(F_UI, 7, "bold"))
+        t.pack(anchor="w")
         v = tk.Label(inn, text=value, bg=C["input"], fg=C["text"],
                      font=(F_MONO, 11, "bold"))
         v.pack(anchor="w")
-        return {"f": f, "inn": inn, "v": v}
+        return {"f": f, "inn": inn, "t": t, "v": v}
 
     def _filter_pill(self, parent, label: str, tip: str) -> dict:
         f = tk.Frame(parent, bg=C["border"], padx=1, pady=1)
@@ -468,44 +466,43 @@ class Dashboard:
         lc = C["red"] if consec_losses >= 2 else C["yellow"] if consec_losses == 1 else C["text"]
         self._loss_val.config(text=f"{consec_losses} / 3", fg=lc)
 
-    def update_indicators(self, data: dict):
-        self._box_ema8["v"].config( text=f"{data.get('ema_fast',   0):,.2f}", fg=C["text"])
-        self._box_ema13["v"].config(text=f"{data.get('ema_medium', 0):,.2f}", fg=C["text"])
-        self._box_ema21["v"].config(text=f"{data.get('ema_slow',   0):,.2f}", fg=C["text"])
+    def update_grid_metrics(self, data: dict):
+        """Update the GRID METRICS strip (level, direction, avg entry, pnl, next add, bail, target)."""
+        level = data.get("level", "--")
+        self._box_ema8["v"].config(text=str(level), fg=C["text"])
 
-        rsi = data.get("rsi", 50)
-        rsi_c = C["red"] if rsi > 70 else C["green"] if rsi < 30 else C["text"]
-        self._box_rsi["v"].config(text=f"{rsi:.1f}", fg=rsi_c)
-        self._box_atr["v"].config(text=f"{data.get('atr', 0):.3f}", fg=C["text"])
+        direction = data.get("direction", "--")
+        dir_c = C["green"] if direction == "LONG" else C["red"] if direction == "SHORT" else C["muted"]
+        self._box_ema13["v"].config(
+            text="▲ LONG" if direction == "LONG" else "▼ SHORT" if direction == "SHORT" else "--",
+            fg=dir_c,
+        )
+        self._box_ema13["inn"].config(
+            bg=C["green_bg"] if direction == "LONG" else C["red_bg"] if direction == "SHORT" else C["input"]
+        )
 
-        adx = data.get("adx", 0)
-        adx_c = C["green"] if adx >= 25 else C["yellow"] if adx >= 20 else C["red"]
-        plus_di  = data.get("plus_di",  0)
-        minus_di = data.get("minus_di", 0)
-        di_str = f"+{plus_di:.0f}/-{minus_di:.0f}"
-        self._box_adx["v"].config(text=f"{adx:.1f}  {di_str}", fg=adx_c)
+        avg = data.get("avg_entry", 0.0)
+        self._box_ema21["v"].config(text=f"{avg:,.2f}" if avg else "--", fg=C["text"])
 
-        spread = data.get("spread", 0)
-        self._spread_val.config(text=f"{spread:.0f} pts",
-                                 fg=C["red"] if spread > 25 else C["green"])
-        self._atr_val.config(text=f"{data.get('atr', 0):.3f}", fg=C["text"])
-        price = data.get("price", 0)
-        if price:
-            self._price_val.config(text=f"{price:,.2f}", fg=C["text"])
+        pnl = data.get("float_pnl", 0.0)
+        pnl_c = C["green"] if pnl >= 0 else C["red"]
+        self._box_rsi["v"].config(text=f"${pnl:+,.2f}" if data.get("basket_open") else "--", fg=pnl_c)
+        self._box_rsi["inn"].config(bg=C["green_bg"] if pnl >= 0 else C["red_bg"] if pnl < -10 else C["input"])
 
-        direction = data.get("direction", "NEUTRAL")
-        if direction == "LONG":
-            self._box_sig["v"].config(text="▲ LONG", fg=C["green"])
-            self._box_sig["inn"].config(bg=C["green_bg"])
-            self._signal_val.config(text="▲ LONG", fg=C["green"])
-        elif direction == "SHORT":
-            self._box_sig["v"].config(text="▼ SHORT", fg=C["red"])
-            self._box_sig["inn"].config(bg=C["red_bg"])
-            self._signal_val.config(text="▼ SHORT", fg=C["red"])
-        else:
-            self._box_sig["v"].config(text="— WAIT", fg=C["muted"])
-            self._box_sig["inn"].config(bg=C["input"])
-            self._signal_val.config(text="— WAIT", fg=C["muted"])
+        next_add = data.get("next_add", 0.0)
+        self._box_atr["v"].config(text=f"{next_add:,.2f}" if next_add else "--", fg=C["muted"])
+
+        bail = data.get("bail_out", 0.0)
+        self._box_adx["v"].config(text=f"${bail:,.0f}" if bail else "--", fg=C["red"])
+
+        target = data.get("profit_target", 0.0)
+        self._box_sig["v"].config(text=f"${target:,.0f}" if target else "--", fg=C["green"])
+        self._box_sig["inn"].config(bg=C["input"])
+
+        self._signal_val.config(
+            text="▲ LONG" if direction == "LONG" else "▼ SHORT" if direction == "SHORT" else "--",
+            fg=dir_c,
+        )
 
     def update_price(self, bid: float, ask: float, spread: float):
         price = (bid + ask) / 2
@@ -517,53 +514,63 @@ class Dashboard:
 
         self.root.after(0, _apply)
 
-    def update_filters(self, filters: dict):
-        for key, w in self._fw.items():
-            ok = bool(filters.get(key, False))
-            bg = C["green_bg"] if ok else C["input"]
-            dot_c = C["green"] if ok else C["muted"]
-            nl_c  = C["green"] if ok else C["sub"]
-            w["inn"].config(bg=bg)
-            w["dot"].config(fg=dot_c, bg=bg)
-            w["nl"].config( fg=nl_c,  bg=bg)
-            w["tl"].config( bg=bg)
-            w["lf"].config( bg=bg)
+    def update_grid_status(self, status: dict):
+        """Update the BASKET STATUS pills. status values are (bool, text) tuples."""
+        def _apply():
+            for key, w in self._fw.items():
+                if key not in status:
+                    continue
+                raw = status[key]
+                ok, text = raw if isinstance(raw, tuple) else (bool(raw), "")
+                bg    = C["green_bg"] if ok else C["input"]
+                dot_c = C["green"]    if ok else C["muted"]
+                nl_c  = C["green"]    if ok else C["sub"]
+                w["inn"].config(bg=bg)
+                w["dot"].config(fg=dot_c, bg=bg)
+                w["nl"].config(text=text, fg=nl_c, bg=bg)
+                w["tl"].config(bg=bg)
+                w["lf"].config(bg=bg)
+        self.root.after(0, _apply)
 
-    def update_positions(self, trades: list):
-        for item in self._tree.get_children():
-            self._tree.delete(item)
-        self._trades_val.config(text=str(len(trades)), fg=C["text"])
-        for t in trades:
-            tag = "long" if t.direction == "LONG" else "short"
-            self._tree.insert("", "end", tags=(tag,), values=(
-                t.ticket,
-                "▲ BUY" if t.direction == "LONG" else "▼ SELL",
-                f"{t.lot_remaining:.2f}",
-                f"{t.entry_price:.2f}",
-                f"{t.sl:.2f}",
-                f"{t.tp1:.2f}",
-                f"{t.tp2:.2f}",
-                f"{t.tp3:.2f}",
-                "--",
-            ))
+    def update_positions(self, rows: list):
+        """rows: list of dicts with keys level, ticket, direction, lot, entry, avg_entry, pnl."""
+        def _apply():
+            for item in self._tree.get_children():
+                self._tree.delete(item)
+            self._trades_val.config(text=str(len(rows)), fg=C["text"])
+            for r in rows:
+                direction = r.get("direction", "LONG")
+                tag = "long" if direction == "LONG" else "short"
+                pnl = r.get("pnl", 0.0)
+                pnl_tag = "pnl_profit" if pnl >= 0 else "pnl_loss"
+                self._tree.insert("", "end", tags=(tag, pnl_tag), values=(
+                    f"L{r.get('level', '?')}",
+                    r.get("ticket", "--"),
+                    "▲ BUY" if direction == "LONG" else "▼ SELL",
+                    f"{r.get('lot', 0):.2f}",
+                    f"{r.get('entry', 0):.2f}",
+                    f"{r.get('avg_entry', 0):.2f}",
+                    f"${pnl:+,.2f}",
+                ))
+        self.root.after(0, _apply)
 
     def update_position_pnl(self, pnls: dict):
-        """Update only the P&L column for open positions (ticket → pnl map)."""
+        """Update the P&L column using ticket → pnl map (called from price ticker)."""
         def _apply():
             for item in self._tree.get_children():
                 vals = self._tree.item(item, "values")
-                if not vals:
+                if not vals or len(vals) < 7:
                     continue
                 try:
-                    ticket = int(vals[0])
+                    ticket = int(vals[1])
                 except (ValueError, IndexError):
                     continue
                 if ticket in pnls:
-                    pnl_val = pnls[ticket]
+                    pnl_val  = pnls[ticket]
                     new_vals = list(vals)
-                    new_vals[8] = f"${pnl_val:+,.2f}"
+                    new_vals[6] = f"${pnl_val:+,.2f}"
                     pnl_tag = "pnl_profit" if pnl_val >= 0 else "pnl_loss"
-                    self._tree.item(item, values=new_vals, tags=(pnl_tag,))
+                    self._tree.item(item, values=new_vals, tags=(new_vals[2], pnl_tag))
         self.root.after(0, _apply)
 
     def update_performance(self, stats: dict):

@@ -1,6 +1,6 @@
 """
-XAUUSD Scalping Bot — main entry point.
-Strategy: M5 EMA Momentum (8/13/21 EMA + RSI + ATR)
+XAUUSD DCA Grid Bot — main entry point.
+Strategy: No-signal DCA basket — add levels as price moves against, close on recovery.
 """
 
 import json
@@ -12,13 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.mt5_connector import MT5Connector
-from core.signal_engine import SignalEngine, NEUTRAL
+from core.grid_manager import GridManager
 from core.risk_manager import RiskManager
-from core.trade_manager import TradeManager, ManagedTrade
-from core.session_filter import is_trading_session, get_active_session_name, utc_now
+from core.session_filter import (
+    get_active_session, get_active_session_name,
+    is_session_ending_soon, utc_now,
+)
 from gui.dashboard import Dashboard
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 log_file = LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -33,78 +35,87 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-# ── State machine states ──────────────────────────────────────────────────────
-STATE_SCANNING = "SCANNING"
-STATE_ENTRY_READY = "ENTRY_READY"
-STATE_IN_TRADE = "IN_TRADE"
+# ── States ────────────────────────────────────────────────────────────────────
+STATE_IDLE         = "IDLE"
+STATE_BASKET_OPEN  = "BASKET_OPEN"
 STATE_COOLING_DOWN = "COOLING_DOWN"
-STATE_STOPPED = "STOPPED"
+STATE_STOPPED      = "STOPPED"
 
 
-class ScalpingBot:
+def _mid(tick: dict) -> float:
+    return (tick["bid"] + tick["ask"]) / 2.0
+
+
+class DCAGridBot:
     def __init__(self, config: dict):
-        self.cfg = config
-        self.symbol = config["symbol"]
-        self.magic = config["magic_number"]
-        self.paper_mode = config.get("paper_mode", False)
+        self.cfg         = config
+        self.symbol      = config["symbol"]
+        self.magic       = config["magic_number"]
+        self.paper_mode  = config.get("paper_mode", False)
 
-        self.connector = MT5Connector("mt5_credentials.json", paper_mode=self.paper_mode)
-        self.signal_engine = SignalEngine(config)
+        self.connector    = MT5Connector("mt5_credentials.json", paper_mode=self.paper_mode)
         self.risk_manager = RiskManager(config)
-        self.trade_manager: TradeManager = None  # init after connector
+        self.grid_manager = GridManager(config, self.connector, self.risk_manager)
 
-        self._state = STATE_STOPPED
-        self._running = False
-        self._cooling_bars = 0
-        self._last_signal: dict = {}
+        self._state      = STATE_STOPPED
+        self._running    = False
+        self._cool_start: datetime = None
+        self._last_balance: float  = 0.0
+        self._symbol_info: dict    = {}
         self._dashboard: Dashboard = None
-
-        self._symbol_info: dict = {}
 
     def attach_dashboard(self, dashboard: Dashboard):
         self._dashboard = dashboard
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
     def start(self):
         logger.info("Bot starting...")
-        # Reuse existing connection from auto-connect; only connect if not already connected
         if not self.connector.is_connected():
             connected = self.connector.connect()
             if not connected and not self.paper_mode:
-                self._log("Failed to connect to MT5. Check credentials and MT5 terminal.", "ERROR")
+                self._log("Failed to connect to MT5.", "ERROR")
                 return
 
-        if self.trade_manager is None:
-            self.trade_manager = TradeManager(self.cfg, self.connector, self.risk_manager)
         if not self._symbol_info:
-            self._symbol_info = self.connector.get_symbol_info(self.symbol) or {
-                "trade_tick_value": 1.0,
-                "trade_tick_size": 0.01,
-                "volume_step": 0.01,
-                "volume_min": 0.01,
-            }
+            self._symbol_info = self.connector.get_symbol_info(self.symbol) or {}
 
         acc = self.connector.get_account_info()
         if acc:
+            self._last_balance = acc["balance"]
             self.risk_manager.set_session_balance(acc["balance"])
 
-        self._state = STATE_SCANNING
+        # Inject volume_step from MT5 into config so grid_manager can use it
+        if "volume_step" not in self.cfg:
+            self.cfg["volume_step"] = self._symbol_info.get("volume_step", 0.01)
+
+        self._state   = STATE_IDLE
         self._running = True
         self._update_dashboard_state()
-        self._log(f"Bot started | Symbol: {self.symbol} | Mode: {'PAPER' if self.paper_mode else 'LIVE'}", "INFO")
-
+        self._log(
+            f"Bot started | Symbol: {self.symbol} | "
+            f"Mode: {'PAPER' if self.paper_mode else 'LIVE'} | "
+            f"Grid: {self.cfg['grid_step']}pts x{self.cfg['max_levels']} levels",
+            "INFO",
+        )
         self._loop()
 
     def stop(self):
         self._running = False
-        self._state = STATE_STOPPED
+        self._state   = STATE_STOPPED
         self.connector.disconnect()
         self._update_dashboard_state()
         self._log("Bot stopped.", "WARN")
 
     def emergency_close_all(self):
-        if self.trade_manager:
-            self.trade_manager.close_all()
-        self._log("Emergency close all executed.", "WARN")
+        if self.grid_manager.basket is not None:
+            tick  = self.connector.get_current_price(self.symbol)
+            price = _mid(tick) if tick else 0.0
+            pnl   = self.grid_manager.close_basket("EMERGENCY", price)
+            self._log(f"Emergency close all | pnl={pnl:+.2f}", "WARN")
+        self._log("Emergency close executed.", "WARN")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _loop(self):
         while self._running:
@@ -113,219 +124,245 @@ class ScalpingBot:
             except Exception as e:
                 logger.exception(f"Tick error: {e}")
                 self._log(f"Error: {e}", "ERROR")
-
-            interval = (
-                self.cfg["polling_interval_trade_ms"]
-                if self._state == STATE_IN_TRADE
-                else self.cfg["polling_interval_scan_ms"]
-            )
-            time.sleep(interval / 1000.0)
+            time.sleep(self.cfg.get("polling_interval_ms", 500) / 1000.0)
 
     def _tick(self):
         now = utc_now()
         if self._dashboard:
             self._dashboard.update_time(now)
 
-        # Update account info
         acc = self.connector.get_account_info()
-        if acc and self._dashboard:
-            self._dashboard.update_account(
-                acc["balance"], acc["equity"],
-                self.risk_manager.daily_pnl,
-                self.risk_manager.consecutive_losses,
-            )
-            self._dashboard.update_performance(self.risk_manager.get_daily_stats())
+        if acc:
+            self._last_balance = acc["balance"]
+            if self._dashboard:
+                self._dashboard.update_account(
+                    acc["balance"], acc["equity"],
+                    self.risk_manager.daily_pnl,
+                    self.risk_manager.consecutive_losses,
+                )
+                self._dashboard.update_performance(self.risk_manager.get_daily_stats())
 
-        session_name = get_active_session_name(now, self.cfg["sessions"])
+        session     = get_active_session(now, self.cfg["sessions"])
+        session_name = session["name"] if session else "CLOSED"
+        in_session  = session is not None
+        ending_soon = is_session_ending_soon(
+            now, session, self.cfg.get("session_close_buffer_min", 5)
+        )
         if self._dashboard:
             self._dashboard.update_session(session_name)
 
-        # ── COOLING_DOWN ──────────────────────────────────────────────
+        # ── COOLING_DOWN ──────────────────────────────────────────────────────
         if self._state == STATE_COOLING_DOWN:
-            self._cooling_bars -= 1
-            if self._cooling_bars <= 0:
-                self._state = STATE_SCANNING
+            elapsed = (now - self._cool_start).total_seconds()
+            if elapsed >= self.cfg.get("cooling_down_seconds", 60):
+                self._state = STATE_IDLE
                 self._update_dashboard_state()
+                self._log("Cooling done — ready for next basket.", "INFO")
+            self._push_dashboard_status(session_name)
             return
 
-        # ── IN_TRADE — monitor positions ──────────────────────────────
-        if self._state == STATE_IN_TRADE:
-            if self.trade_manager.trade_count() == 0:
-                self._state = STATE_COOLING_DOWN
-                self._cooling_bars = self.cfg["cooling_down_candles"]
-                self._update_dashboard_state()
-                self._log("All positions closed → cooling down", "INFO")
-                return
-
-            tick = self.connector.get_current_price(self.symbol)
-            if tick:
-                price = (tick["bid"] + tick["ask"]) / 2
-                df = self.connector.get_ohlcv(self.symbol, self.cfg["timeframe"], self.cfg["ohlcv_bars"])
-                events = self.trade_manager.monitor(price, df, self.signal_engine)
-                for ev in events:
-                    self._log(f"Trade event: {ev['type']} ticket={ev['ticket']}", "TRADE")
-
-                if self._dashboard:
-                    self._dashboard.update_positions(self.trade_manager.get_trades())
-
-            # Sync with MT5 open positions to detect SL hits
-            self._sync_positions()
-            return
-
-        # ── SESSION GATE ──────────────────────────────────────────────
-        if not is_trading_session(now, self.cfg["sessions"]):
-            return
-
-        # Already halted — don't re-scan or re-log every tick
+        # ── STOPPED ───────────────────────────────────────────────────────────
         if self._state == STATE_STOPPED:
+            self._push_dashboard_status(session_name)
             return
 
-        # ── DAILY LIMIT CHECK ─────────────────────────────────────────
+        # ── DAILY LIMITS ──────────────────────────────────────────────────────
         can_trade, reason = self.risk_manager.check_daily_limits()
         if not can_trade:
+            if self.grid_manager.basket is not None:
+                tick  = self.connector.get_current_price(self.symbol)
+                price = _mid(tick) if tick else 0.0
+                pnl   = self.grid_manager.close_basket("DAILY_LIMIT", price)
+                self._log(f"Basket force-closed [DAILY_LIMIT] pnl={pnl:+.2f}", "WARN")
             self._log(f"Trading halted: {reason}", "WARN")
             self._state = STATE_STOPPED
             self._update_dashboard_state()
             return
 
-        # ── MAX POSITIONS CHECK ───────────────────────────────────────
-        if self.trade_manager and self.trade_manager.trade_count() >= self.cfg["max_concurrent_positions"]:
+        # ── BASKET_OPEN ───────────────────────────────────────────────────────
+        if self._state == STATE_BASKET_OPEN:
+            self._monitor_basket(now, in_session, ending_soon, session_name)
             return
 
-        # ── SCANNING — fetch data and signals ─────────────────────────
-        spread = self.connector.get_current_spread(self.symbol) or 999
-        df = self.connector.get_ohlcv(self.symbol, self.cfg["timeframe"], self.cfg["ohlcv_bars"])
+        # ── IDLE ──────────────────────────────────────────────────────────────
+        if self._state == STATE_IDLE:
+            if not in_session or ending_soon:
+                self._push_dashboard_status(session_name)
+                return
+            self._try_start_basket(session_name)
 
-        if df is None or len(df) < 30:
-            self._log("Insufficient data", "WARN")
+    # ── Basket logic ──────────────────────────────────────────────────────────
+
+    def _monitor_basket(self, now, in_session, ending_soon, session_name):
+        basket = self.grid_manager.basket
+        if basket is None:
+            self._enter_cooling_down(now)
             return
 
-        signal = self.signal_engine.get_signal(df, spread)
-        self._last_signal = signal
+        tick = self.connector.get_current_price(self.symbol)
+        if not tick:
+            return
+        price   = _mid(tick)
+        pnl     = self.grid_manager.get_basket_pnl(price)
+        profit  = self.grid_manager.get_profit_target_dollars()
+        bail    = self.grid_manager.get_bail_out_dollars(self._last_balance)
 
-        if self._dashboard:
-            tick = self.connector.get_current_price(self.symbol)
-            price = (tick["bid"] + tick["ask"]) / 2 if tick else 0
-            self._dashboard.update_indicators({
-                "ema_fast":  signal.get("ema_fast", 0),
-                "ema_medium":signal.get("ema_medium", 0),
-                "ema_slow":  signal.get("ema_slow", 0),
-                "rsi":       signal.get("rsi", 50),
-                "atr":       signal.get("atr", 0),
-                "adx":       signal.get("adx", 0),
-                "plus_di":   signal.get("plus_di", 0),
-                "minus_di":  signal.get("minus_di", 0),
-                "spread":    spread,
-                "price":     price,
-                "direction": signal.get("direction", "NEUTRAL"),
-            })
-            self._dashboard.update_filters(signal.get("filters", {}))
+        self._push_dashboard_status(session_name, price, pnl, bail)
 
-        direction = signal.get("direction", NEUTRAL)
-        if direction == NEUTRAL:
-            if self._state == STATE_ENTRY_READY:
-                self._state = STATE_SCANNING
-                self._update_dashboard_state()
+        # Session ending / outside session — close basket cleanly
+        if not in_session or ending_soon:
+            closed_pnl = self.grid_manager.close_basket("SESSION_END", price)
+            self._log(f"Basket closed [SESSION_END] pnl={closed_pnl:+.2f}", "TRADE")
+            self._enter_cooling_down(now)
             return
 
-        # ── ENTRY_READY ───────────────────────────────────────────────
-        if self._state == STATE_SCANNING:
-            self._state = STATE_ENTRY_READY
-            self._update_dashboard_state()
+        # Profit target hit
+        if pnl >= profit:
+            closed_pnl = self.grid_manager.close_basket("PROFIT", price)
             self._log(
-                f"Entry ready: {direction} | RSI={signal['rsi']:.1f} | "
-                f"ATR={signal['atr']:.2f} | ADX={signal.get('adx', 0):.1f} "
-                f"(+DI={signal.get('plus_di', 0):.1f} -DI={signal.get('minus_di', 0):.1f})",
-                "INFO",
+                f"Basket closed [PROFIT] levels={basket.level_count} "
+                f"pnl={closed_pnl:+.2f}",
+                "TRADE",
             )
+            self._enter_cooling_down(now)
             return
 
-        if self._state == STATE_ENTRY_READY:
-            self._execute_entry(signal, acc)
+        # Bail-out
+        if pnl <= bail:
+            closed_pnl = self.grid_manager.close_basket("BAIL_OUT", price)
+            self._log(
+                f"Basket closed [BAIL_OUT] levels={basket.level_count} "
+                f"pnl={closed_pnl:+.2f}",
+                "WARN",
+            )
+            self._enter_cooling_down(now)
+            return
 
-    def _execute_entry(self, signal: dict, acc: dict):
-        direction = signal["direction"]
-        atr = signal["atr"]
-        sl = signal["sl"]
-        tp3 = signal["tp3"]
+        # Add next DCA level if price moved grid_step against us
+        spread = self.connector.get_current_spread(self.symbol) or 999
+        if spread <= self.cfg["max_spread_points"] and self.grid_manager.check_should_add(price):
+            if not self.connector.is_algo_trading_enabled():
+                self._log("Algo Trading disabled — cannot add level.", "ERROR")
+                return
+            if self.grid_manager.add_level(self._last_balance):
+                b = self.grid_manager.basket
+                self._log(
+                    f"Level {b.level_count} added @ {price:.2f} | "
+                    f"avg={b.avg_entry():.2f} | net={b.net_lots:.2f}L",
+                    "TRADE",
+                )
+                if self._dashboard:
+                    self._dashboard.update_positions(
+                        self._basket_to_rows(b, price, pnl, bail)
+                    )
 
-        balance = acc["balance"] if acc else 10000.0
-        tick_value = self._symbol_info.get("trade_tick_value", 1.0)   # $ per lot per 1 tick
-        tick_size  = self._symbol_info.get("trade_tick_size", 0.01)   # price units per 1 tick
-        volume_step = self._symbol_info.get("volume_step", 0.01)
-        sl_distance = signal["sl_distance"]
-
-        lot = self.risk_manager.calculate_lot_size(balance, sl_distance, tick_value, tick_size, volume_step)
-        lot = max(lot, self._symbol_info.get("volume_min", 0.01))
+    def _try_start_basket(self, session_name):
+        spread = self.connector.get_current_spread(self.symbol) or 999
+        if spread > self.cfg["max_spread_points"]:
+            return
 
         if not self.connector.is_algo_trading_enabled():
-            self._log("Order blocked: enable Algo Trading in the MT5 terminal toolbar (the 'Algo Trading' button).", "ERROR")
+            self._log("Order blocked: enable Algo Trading in MT5 toolbar.", "ERROR")
             self._state = STATE_STOPPED
             self._update_dashboard_state()
             return
 
-        self._log(f"Entering {direction} | Lot={lot:.2f} | SL={sl:.2f} | TP3={tp3:.2f}", "TRADE")
-
-        ticket = self.connector.place_order(
-            self.symbol, direction, lot, sl, tp3, self.magic
+        df = self.connector.get_ohlcv(
+            self.symbol, self.cfg["timeframe"], self.cfg["ohlcv_bars"]
         )
+        direction = self.grid_manager.get_direction(df)
 
-        if ticket is None:
-            self._log("Order placement failed", "ERROR")
-            self._state = STATE_SCANNING
+        if self.grid_manager.start_basket(direction, self._last_balance):
+            self._state = STATE_BASKET_OPEN
             self._update_dashboard_state()
-            return
+            b = self.grid_manager.basket
+            tick  = self.connector.get_current_price(self.symbol)
+            price = _mid(tick) if tick else 0.0
+            self._log(
+                f"Basket started [{direction}] @ {price:.2f} | "
+                f"lot={b.orders[0].lot:.2f} | session={session_name}",
+                "TRADE",
+            )
+        else:
+            self._log("Failed to start basket.", "ERROR")
 
-        trade = ManagedTrade(
-            ticket=ticket,
-            symbol=self.symbol,
-            direction=direction,
-            entry_price=signal["close"],
-            lot_total=lot,
-            sl=sl,
-            tp1=signal["tp1"],
-            tp2=signal["tp2"],
-            tp3=tp3,
-        )
-        self.trade_manager.add_trade(trade)
-
-        self._state = STATE_IN_TRADE
+    def _enter_cooling_down(self, now):
+        self._state      = STATE_COOLING_DOWN
+        self._cool_start = now
         self._update_dashboard_state()
-
+        secs = self.cfg.get("cooling_down_seconds", 60)
+        self._log(f"Cooling down {secs}s before next basket.", "INFO")
         if self._dashboard:
-            self._dashboard.update_positions(self.trade_manager.get_trades())
+            self._dashboard.update_positions([])
 
-    def _sync_positions(self):
-        open_tickets = {p.ticket for p in self.connector.get_open_positions(self.symbol, self.magic)}
-        managed_tickets = {t.ticket for t in self.trade_manager.get_trades()}
+    # ── Dashboard helpers ─────────────────────────────────────────────────────
 
-        closed = managed_tickets - open_tickets
-        for ticket in closed:
-            tick = self.connector.get_current_price(self.symbol)
-            exit_price = (tick["bid"] + tick["ask"]) / 2 if tick else 0
-            self.trade_manager.handle_sl_hit(ticket, exit_price)
-            self._log(f"SL hit detected: ticket={ticket}", "WARN")
+    def _push_dashboard_status(self, session_name, price=0.0, pnl=0.0,
+                                bail=0.0):
+        if not self._dashboard:
+            return
+        basket = self.grid_manager.basket
+        if basket:
+            profit = self.grid_manager.get_profit_target_dollars()
+            rows = self._basket_to_rows(basket, price, pnl, bail)
+            self._dashboard.update_positions(rows)
+            self._dashboard.update_grid_status({
+                "basket_active": (True,  "OPEN"),
+                "direction":     (True,  basket.direction),
+                "levels":        (basket.level_count < self.cfg["max_levels"],
+                                  f"{basket.level_count} / {self.cfg['max_levels']}"),
+                "float_pnl":     (pnl >= 0, f"${pnl:+,.2f}"),
+                "next_add":      (True,
+                                  f"@ {basket.next_add_price(self.cfg['grid_step']):.2f}"),
+                "session":       (True,  session_name),
+            })
+            self._dashboard.update_grid_metrics({
+                "basket_open":    True,
+                "level":          f"{basket.level_count}/{self.cfg['max_levels']}",
+                "direction":      basket.direction,
+                "avg_entry":      basket.avg_entry(),
+                "float_pnl":      pnl,
+                "next_add":       basket.next_add_price(self.cfg["grid_step"]),
+                "bail_out":       bail,
+                "profit_target":  profit,
+            })
+        else:
+            self._dashboard.update_grid_status({
+                "basket_active": (False, "NO BASKET"),
+                "direction":     (False, "--"),
+                "levels":        (True,  f"0 / {self.cfg['max_levels']}"),
+                "float_pnl":     (True,  "$0.00"),
+                "next_add":      (False, "--"),
+                "session":       (bool(session_name != "CLOSED"), session_name),
+            })
+            self._dashboard.update_grid_metrics({
+                "basket_open": False,
+                "level": "--", "direction": "--", "avg_entry": 0,
+                "float_pnl": 0, "next_add": 0, "bail_out": 0, "profit_target": 0,
+            })
 
-    def _start_price_ticker(self):
-        def _ticker():
-            while self.connector.is_connected():
-                try:
-                    tick = self.connector.get_current_price(self.symbol)
-                    spread = self.connector.get_current_spread(self.symbol) or 0
-                    if tick and self._dashboard:
-                        mid = (tick["bid"] + tick["ask"]) / 2
-                        self._dashboard.update_price(tick["bid"], tick["ask"], spread)
-                        if self.trade_manager:
-                            pnls = {t.ticket: t.unrealized_pnl(mid)
-                                    for t in self.trade_manager.get_trades()}
-                            if pnls:
-                                self._dashboard.update_position_pnl(pnls)
-                except Exception:
-                    pass
-                time.sleep(0.2)
-
-        t = threading.Thread(target=_ticker, daemon=True)
-        t.start()
+    def _basket_to_rows(self, basket, price: float, total_pnl: float,
+                         bail: float) -> list:
+        if not basket or not basket.orders:
+            return []
+        avg = basket.avg_entry()
+        contract_size = self.cfg.get("contract_size", 100.0)
+        rows = []
+        for i, order in enumerate(basket.orders, 1):
+            if basket.direction == "LONG":
+                order_pnl = (price - order.entry_price) * order.lot * contract_size
+            else:
+                order_pnl = (order.entry_price - price) * order.lot * contract_size
+            rows.append({
+                "level":      i,
+                "ticket":     order.ticket,
+                "direction":  basket.direction,
+                "lot":        order.lot,
+                "entry":      order.entry_price,
+                "avg_entry":  avg,
+                "pnl":        order_pnl,
+            })
+        return rows
 
     def _update_dashboard_state(self):
         if self._dashboard:
@@ -336,6 +373,33 @@ class ScalpingBot:
         if self._dashboard:
             self._dashboard.log(msg, level)
 
+    # ── Price ticker (200 ms, separate thread) ────────────────────────────────
+
+    def _start_price_ticker(self):
+        def _ticker():
+            while self.connector.is_connected():
+                try:
+                    tick   = self.connector.get_current_price(self.symbol)
+                    spread = self.connector.get_current_spread(self.symbol) or 0
+                    if tick and self._dashboard:
+                        self._dashboard.update_price(tick["bid"], tick["ask"], spread)
+                        basket = self.grid_manager.basket
+                        if basket and tick:
+                            price = _mid(tick)
+                            pnl   = self.grid_manager.get_basket_pnl(price)
+                            bail  = self.grid_manager.get_bail_out_dollars(
+                                self._last_balance
+                            )
+                            self._dashboard.update_position_pnl(
+                                {order.ticket: pnl / basket.level_count
+                                 for order in basket.orders}
+                            )
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        threading.Thread(target=_ticker, daemon=True).start()
+
 
 def load_config() -> dict:
     with open("config.json") as f:
@@ -345,18 +409,13 @@ def load_config() -> dict:
 def main():
     os.chdir(Path(__file__).parent)
     cfg = load_config()
-    bot = ScalpingBot(cfg)
+    bot = DCAGridBot(cfg)
 
-    def on_start():
-        bot.start()
-
-    def on_stop():
-        bot.stop()
-
-    def on_close_all():
-        bot.emergency_close_all()
-
-    dashboard = Dashboard(on_start=on_start, on_stop=on_stop, on_close_all=on_close_all)
+    dashboard = Dashboard(
+        on_start=bot.start,
+        on_stop=bot.stop,
+        on_close_all=bot.emergency_close_all,
+    )
     bot.attach_dashboard(dashboard)
 
     def auto_connect():
@@ -367,28 +426,30 @@ def main():
             dashboard.update_connection(True)
             if acc:
                 bot.risk_manager.set_session_balance(acc["balance"])
-                bot.trade_manager = TradeManager(cfg, bot.connector, bot.risk_manager)
-                bot._symbol_info = bot.connector.get_symbol_info(bot.symbol) or {
-                    "trade_tick_value": 1.0,
-                    "trade_tick_size": 0.01,
-                    "volume_step": 0.01,
-                    "volume_min": 0.01,
-                }
-                mode_tag = " | ⚠ PAPER MODE — no real orders" if cfg.get("paper_mode") else " | LIVE TRADING"
+                bot._last_balance = acc["balance"]
+                bot._symbol_info  = bot.connector.get_symbol_info(bot.symbol) or {}
+                bot.cfg["volume_step"] = bot._symbol_info.get("volume_step", 0.01)
+                mode_tag = " | PAPER MODE" if cfg.get("paper_mode") else " | LIVE TRADING"
                 dashboard.log(
-                    f"Connected | Account: {acc['login']} | Balance: {acc['currency']} {acc['balance']:,.2f}{mode_tag}",
+                    f"Connected | Account: {acc['login']} | "
+                    f"Balance: {acc['currency']} {acc['balance']:,.2f}{mode_tag}",
                     "TRADE" if not cfg.get("paper_mode") else "WARN",
                 )
                 dashboard.update_account(acc["balance"], acc["equity"], 0.0, 0)
                 bot._start_price_ticker()
         else:
             dashboard.update_connection(False)
-            dashboard.log("MT5 connection failed. Check mt5_credentials.json and ensure MT5 terminal is running.", "ERROR")
+            dashboard.log(
+                "MT5 connection failed. Check mt5_credentials.json "
+                "and ensure MT5 terminal is running.",
+                "ERROR",
+            )
 
-    # Auto-connect in background thread after GUI is shown
-    dashboard.schedule(500, lambda: threading.Thread(target=auto_connect, daemon=True).start())
-    dashboard.log("Starting... auto-connecting to MT5 terminal.", "INFO")
-
+    dashboard.schedule(
+        500,
+        lambda: threading.Thread(target=auto_connect, daemon=True).start(),
+    )
+    dashboard.log("Starting — auto-connecting to MT5 terminal.", "INFO")
     dashboard.run()
 
 
